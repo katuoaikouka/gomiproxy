@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Stealth Engine v2</title>
+    <style>
+        body { margin: 0; background: #1a1a1a; color: #fff; font-family: sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+        .toolbar { padding: 10px; background: #333; display: flex; gap: 10px; }
+        input { flex: 1; padding: 8px; border-radius: 4px; border: none; }
+        button { padding: 8px 20px; background: #00e676; border: none; cursor: pointer; font-weight: bold; }
+        #viewer { flex: 1; border: none; background: #fff; }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <input type="text" id="urlInput" placeholder="URLを入力...">
+        <button onclick="loadSite()">GO</button>
+    </div>
+    <iframe id="viewer"></iframe>
+
+    <script>
+        const SECRET_KEY = 0xAB;
+        const transform = (data) => {
+            const buf = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+            return buf.map(b => b ^ SECRET_KEY);
+        };
+
+        const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`);
+        const viewer = document.getElementById('viewer');
+        const pendingRequests = new Map();
+
+        ws.onmessage = async (e) => {
+            const data = new Uint8Array(await e.data.arrayBuffer());
+            const res = JSON.parse(new TextDecoder().decode(transform(data)));
+            
+            if (res.id && pendingRequests.has(res.id)) {
+                pendingRequests.get(res.id)(res);
+                pendingRequests.delete(res.id);
+            } else if (res.contentType?.includes('text/html')) {
+                const blob = new Blob([Uint8Array.from(atob(res.body), c => c.charCodeAt(0))], {type: res.contentType});
+                viewer.src = URL.createObjectURL(blob);
+            }
+        };
+
+        // Service Workerからの依頼をWebSocketへ
+        navigator.serviceWorker.register('/sw.js');
+        navigator.serviceWorker.onmessage = (event) => {
+            if (event.data.type === 'PROXY_REQ') {
+                const id = Math.random().toString(36).slice(2);
+                pendingRequests.set(id, (response) => {
+                    event.ports.postMessage(response);
+                });
+                ws.send(transform(JSON.stringify({ ...event.data, id })));
+            }
+        };
+
+        function loadSite() {
+            let url = document.getElementById('urlInput').value;
+            if (!url.startsWith('http')) url = 'https://' + url;
+            ws.send(transform(JSON.stringify({ url, method: 'GET' })));
+        }
+    </script>
+</body>
+</html>
