@@ -8,75 +8,91 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const SECRET_KEY = 0xAB; 
-
-// 既存の難読化（XOR）
+const SECRET_KEY = 0xAB;
 const transform = (buf) => Buffer.from(buf).map(b => b ^ SECRET_KEY);
 
-// CSS内の url() 指定を正規化する補助関数
-const rewriteCSS = (css, targetUrl) => {
-    return css.replace(/url\(['"]?([^'"]+)['"]?\)/g, (match, p1) => {
-        try {
-            if (p1.startsWith('data:') || p1.startsWith('http')) return match;
-            return `url("${new URL(p1, targetUrl).href}")`;
-        } catch(e) {
-            return match;
-        }
-    });
-};
-
-// リソース書き換え機能: HTMLおよびCSS内のパスを正規化
+// リソース書き換えロジック
 const rewriteResources = (content, targetUrl, contentType) => {
-    // HTMLのリライト
+    const urlObj = new URL(targetUrl);
+    const origin = urlObj.origin;
+
     if (contentType.includes('text/html')) {
         const $ = cheerio.load(content);
-        const urlObj = new URL(targetUrl);
 
-        // 1. <base>タグを挿入して相対パスの基準をターゲットドメインに固定
-        $('head').prepend(`<base href="${urlObj.origin}${urlObj.pathname}">`);
-        
-        // ゲーム用にCanvasを全画面表示にするスタイルを強制注入
-        $('head').append(`
-            <style>
-                body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
-                canvas { display: block; width: 100vw; height: 100vh; }
-            </style>
-        `);
+        // 1. 最優先で実行される偽装スクリプトを注入
+        const injection = `
+        <script>
+        (function() {
+            window.__TARGET_ORIGIN__ = "${origin}";
+            window.__TARGET_URL__ = "${targetUrl}";
 
-        // 2. a, img, link, script 等のURL属性を修正（絶対パス化）
-        $('a, img, link, script, source, iframe, form').each((i, el) => {
-            ['href', 'src', 'action'].forEach(attr => {
+            // Locationの偽装
+            const locMock = Object.create(null);
+            ['href', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin'].forEach(p => {
+                Object.defineProperty(locMock, p, {
+                    get: () => new URL(window.__TARGET_URL__)[p],
+                    set: (v) => console.log("Blocked Nav:", v)
+                });
+            });
+            window.__PROXY_LOC__ = locMock;
+
+            // XHRのパッチ
+            const OldXHR = window.XMLHttpRequest;
+            window.XMLHttpRequest = function() {
+                const xhr = new OldXHR();
+                const oldOpen = xhr.open;
+                xhr.open = function(method, url) {
+                    if (!url.startsWith('http')) url = new URL(url, window.__TARGET_ORIGIN__).href;
+                    return oldOpen.apply(this, [method, url, ...Array.from(arguments).slice(2)]);
+                };
+                return xhr;
+            };
+
+            // Fetchのパッチ
+            const oldFetch = window.fetch;
+            window.fetch = function(input, init) {
+                let url = (typeof input === 'string') ? input : input.url;
+                if (!url.startsWith('http')) url = new URL(url, window.__TARGET_ORIGIN__).href;
+                return oldFetch(url, init);
+            };
+        })();
+        </script>`;
+
+        $('head').prepend(injection);
+        $('head').prepend(`<base href="${origin}/">`);
+
+        // 静的パスのリライト
+        $('[src], [href], [action]').each((i, el) => {
+            ['src', 'href', 'action'].forEach(attr => {
                 const val = $(el).attr(attr);
-                if (val && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith('javascript:')) {
-                    try {
-                        $(el).attr(attr, new URL(val, targetUrl).href);
-                    } catch (e) {}
+                if (val && !val.startsWith('data:') && !val.startsWith('#')) {
+                    try { $(el).attr(attr, new URL(val, targetUrl).href); } catch(e) {}
                 }
             });
         });
 
-        // 3. インラインCSSのリライト
-        $('style').each((i, el) => {
-            const css = $(el).text();
-            $(el).text(rewriteCSS(css, targetUrl));
-        });
-
-        // 4. セキュリティポリシー(CSP)およびフレーム制限の解除
+        // セキュリティ解除
         $('meta[http-equiv*="Content-Security-Policy" i]').remove();
-        $('meta[name*="viewport"]').attr('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no');
-
         return $.html();
     }
-    
-    // CSSファイル単体のリライト
-    if (contentType.includes('text/css')) {
-        return rewriteCSS(content.toString(), targetUrl);
+
+    if (contentType.includes('javascript')) {
+        return content.toString()
+            .replace(/\bwindow\.location\b/g, 'window.__PROXY_LOC__')
+            .replace(/\bdocument\.location\b/g, 'window.__PROXY_LOC__');
     }
-    
+
+    if (contentType.includes('text/css')) {
+        return content.toString().replace(/url\(['"]?([^'"]+)['"]?\)/g, (match, p1) => {
+            try {
+                if (p1.startsWith('data:') || p1.startsWith('http')) return match;
+                return `url("${new URL(p1, targetUrl).href}")`;
+            } catch(e) { return match; }
+        });
+    }
+
     return content;
 };
-
-app.use(express.static('public'));
 
 wss.on('connection', (ws) => {
     const jar = new Map();
@@ -84,18 +100,16 @@ wss.on('connection', (ws) => {
     ws.on('message', async (msg) => {
         try {
             const decrypted = transform(msg).toString();
-            const { url, method, headers, data } = JSON.parse(decrypted);
+            const { url, method, headers, body, id } = JSON.parse(decrypted);
             const urlObj = new URL(url);
-            const host = urlObj.hostname;
 
             const res = await axios({
                 url,
                 method: method || 'GET',
-                data: data || null,
+                data: body ? Buffer.from(body, 'base64') : null,
                 headers: {
                     ...headers,
-                    'Cookie': jar.get(host) || '',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    'Cookie': jar.get(urlObj.hostname) || '',
                     'Referer': url,
                     'Origin': urlObj.origin
                 },
@@ -104,24 +118,22 @@ wss.on('connection', (ws) => {
             });
 
             if (res.headers['set-cookie']) {
-                jar.set(host, res.headers['set-cookie'].map(c => c.split(';')[0]).join('; '));
+                jar.set(urlObj.hostname, res.headers['set-cookie'].map(c => c.split(';')).join('; '));
             }
 
             let bodyData = res.data;
             const contentType = res.headers['content-type'] || '';
 
-            // ゲーム用リソース（WASMやバイナリ）は書き換えずにそのまま送る
-            // HTMLまたはCSSの場合のみリライトを実行
-            if (contentType.includes('text/html') || contentType.includes('text/css')) {
+            if (contentType.includes('text/html') || contentType.includes('text/css') || contentType.includes('javascript')) {
                 bodyData = Buffer.from(rewriteResources(bodyData.toString(), url, contentType));
             }
 
-            // バイナリ整合性を守るためBase64で送信
             ws.send(transform(JSON.stringify({
+                id,
+                url,
                 body: bodyData.toString('base64'),
                 status: res.status,
-                contentType: contentType,
-                url: url
+                contentType
             })));
         } catch (e) {
             ws.send(transform(JSON.stringify({ error: e.message })));
@@ -129,5 +141,5 @@ wss.on('connection', (ws) => {
     });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Stealth Engine active on port ${PORT}`));
+app.use(express.static('public'));
+server.listen(3000, () => console.log('Server running on port 3000'));
