@@ -3,6 +3,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const https = require('https');
 
 const app = express();
 const server = http.createServer(app);
@@ -11,7 +12,6 @@ const wss = new WebSocket.Server({ server });
 const SECRET_KEY = 0xAB;
 const transform = (buf) => Buffer.from(buf).map(b => b ^ SECRET_KEY);
 
-// リソース書き換えロジック
 const rewriteResources = (content, targetUrl, contentType) => {
     const urlObj = new URL(targetUrl);
     const origin = urlObj.origin;
@@ -19,40 +19,44 @@ const rewriteResources = (content, targetUrl, contentType) => {
     if (contentType.includes('text/html')) {
         const $ = cheerio.load(content);
 
-        // 1. 最優先で実行される偽装スクリプトを注入
         const injection = `
         <script>
         (function() {
             window.__TARGET_ORIGIN__ = "${origin}";
             window.__TARGET_URL__ = "${targetUrl}";
 
-            // Locationの偽装
             const locMock = Object.create(null);
             ['href', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin'].forEach(p => {
                 Object.defineProperty(locMock, p, {
                     get: () => new URL(window.__TARGET_URL__)[p],
-                    set: (v) => console.log("Blocked Nav:", v)
+                    set: (v) => console.log("Nav Blocked:", v)
                 });
             });
             window.__PROXY_LOC__ = locMock;
 
-            // XHRのパッチ
+            // iframe脱出防止
+            window.top = window.self;
+            window.parent = window.self;
+
             const OldXHR = window.XMLHttpRequest;
             window.XMLHttpRequest = function() {
                 const xhr = new OldXHR();
                 const oldOpen = xhr.open;
                 xhr.open = function(method, url) {
-                    if (!url.startsWith('http')) url = new URL(url, window.__TARGET_ORIGIN__).href;
-                    return oldOpen.apply(this, [method, url, ...Array.from(arguments).slice(2)]);
+                    if (typeof url === 'string' && !url.startsWith('http')) {
+                        url = new URL(url, window.__TARGET_ORIGIN__).href;
+                    }
+                    return oldOpen.apply(this, arguments);
                 };
                 return xhr;
             };
 
-            // Fetchのパッチ
             const oldFetch = window.fetch;
             window.fetch = function(input, init) {
                 let url = (typeof input === 'string') ? input : input.url;
-                if (!url.startsWith('http')) url = new URL(url, window.__TARGET_ORIGIN__).href;
+                if (typeof url === 'string' && !url.startsWith('http')) {
+                    url = new URL(url, window.__TARGET_ORIGIN__).href;
+                }
                 return oldFetch(url, init);
             };
         })();
@@ -60,8 +64,9 @@ const rewriteResources = (content, targetUrl, contentType) => {
 
         $('head').prepend(injection);
         $('head').prepend(`<base href="${origin}/">`);
+        $('meta[http-equiv*="Content-Security-Policy" i]').remove();
+        $('meta[name="referrer"]').remove();
 
-        // 静的パスのリライト
         $('[src], [href], [action]').each((i, el) => {
             ['src', 'href', 'action'].forEach(attr => {
                 const val = $(el).attr(attr);
@@ -71,15 +76,15 @@ const rewriteResources = (content, targetUrl, contentType) => {
             });
         });
 
-        // セキュリティ解除
-        $('meta[http-equiv*="Content-Security-Policy" i]').remove();
         return $.html();
     }
 
     if (contentType.includes('javascript')) {
         return content.toString()
             .replace(/\bwindow\.location\b/g, 'window.__PROXY_LOC__')
-            .replace(/\bdocument\.location\b/g, 'window.__PROXY_LOC__');
+            .replace(/\bdocument\.location\b/g, 'window.__PROXY_LOC__')
+            .replace(/\bwindow\.top\b/g, 'window.self')
+            .replace(/\bwindow\.parent\b/g, 'window.self');
     }
 
     if (contentType.includes('text/css')) {
@@ -111,14 +116,18 @@ wss.on('connection', (ws) => {
                     ...headers,
                     'Cookie': jar.get(urlObj.hostname) || '',
                     'Referer': url,
-                    'Origin': urlObj.origin
+                    'Origin': urlObj.origin,
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept-Encoding': 'identity'
                 },
                 responseType: 'arraybuffer',
-                validateStatus: false
+                validateStatus: false,
+                httpsAgent: new https.Agent({ rejectUnauthorized: false })
             });
 
             if (res.headers['set-cookie']) {
-                jar.set(urlObj.hostname, res.headers['set-cookie'].map(c => c.split(';')).join('; '));
+                const cookies = res.headers['set-cookie'].map(c => c.split(';')).join('; ');
+                jar.set(urlObj.hostname, cookies);
             }
 
             let bodyData = res.data;
@@ -142,4 +151,4 @@ wss.on('connection', (ws) => {
 });
 
 app.use(express.static('public'));
-server.listen(3000, () => console.log('Server running on port 3000'));
+server.listen(3000, () => console.log('Stealth Server: http://localhost:3000'));
